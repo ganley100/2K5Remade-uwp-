@@ -1,0 +1,116 @@
+name: Xbox UWP build
+
+on:
+  push:
+    paths:
+      - "uwp/**"
+      - ".github/workflows/build-uwp.yml"
+  pull_request:
+    paths:
+      - "uwp/**"
+      - ".github/workflows/build-uwp.yml"
+  workflow_dispatch:
+
+jobs:
+  # Compiles the launcher's portable code (file layer, SHA-256) with GCC.
+  # This is the POSIX build that the importer tests use.
+  check-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile portable launcher sources
+        run: |
+          set -e
+          mkdir -p build-check
+          for f in uwp/src/*.cpp; do
+            case "$f" in
+              uwp/src/App.cpp|uwp/src/Launcher.cpp|uwp/src/GameHost.cpp) continue ;;  # UWP-only
+            esac
+            echo "g++ $f"
+            g++ -std=c++17 -Wall -Wextra -c "$f" -o "build-check/$(basename "$f" .cpp).o"
+          done
+
+  # Compiles the same sources with MSVC against the Windows SDK, which checks
+  # the *FromApp (broadFileSystemAccess) code paths used on Xbox.
+  check-windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Compile launcher sources (MSVC, Windows SDK)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build-check | Out-Null
+          $skip = @('App.cpp', 'Launcher.cpp', 'GameHost.cpp')
+          Get-ChildItem uwp/src/*.cpp | Where-Object { $skip -notcontains $_.Name } | ForEach-Object {
+            Write-Host "cl $($_.Name)"
+            cl /nologo /c /std:c++17 /EHsc /W4 /permissive- /DUNICODE /D_UNICODE `
+               /Fo"build-check\$($_.BaseName).obj" $_.FullName
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+  # Builds the installable .appx for Xbox Developer Mode once the UWP app
+  # project (uwp/CMakeLists.txt) exists. Until then this job reports that it
+  # was skipped.
+  package:
+    runs-on: windows-2022
+    needs: [check-linux, check-windows]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Is the UWP app project present?
+        id: project
+        shell: pwsh
+        run: |
+          if (Test-Path uwp/CMakeLists.txt) { "present=true" >> $env:GITHUB_OUTPUT }
+          else {
+            "present=false" >> $env:GITHUB_OUTPUT
+            Write-Host "::notice::uwp/CMakeLists.txt not added yet - no .appx built in this run."
+          }
+
+      - name: Configure (WindowsStore / UWP, x64)
+        if: steps.project.outputs.present == 'true'
+        run: cmake -S uwp -B build-uwp -G "Visual Studio 17 2022" -A x64 -DCMAKE_SYSTEM_NAME=WindowsStore -DCMAKE_SYSTEM_VERSION=10.0
+
+      - name: Create a self-signed test certificate
+        if: steps.project.outputs.present == 'true'
+        shell: pwsh
+        run: |
+          # Publisher must match Identity/@Publisher in uwp/Package.appxmanifest.
+          $cert = New-SelfSignedCertificate -Type Custom -Subject "CN=2K5Remade" `
+            -KeyUsage DigitalSignature -FriendlyName "2K5Remade test signing" `
+            -CertStoreLocation "Cert:\CurrentUser\My" `
+            -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")
+          $pwd = ConvertTo-SecureString -String "2k5remade" -Force -AsPlainText
+          Export-PfxCertificate -Cert $cert -FilePath "$env:GITHUB_WORKSPACE\build-uwp\test-signing.pfx" -Password $pwd | Out-Null
+          Export-Certificate -Cert $cert -FilePath "$env:GITHUB_WORKSPACE\build-uwp\test-signing.cer" | Out-Null
+
+      - uses: microsoft/setup-msbuild@v2
+        if: steps.project.outputs.present == 'true'
+
+      - name: Build and package .appx
+        if: steps.project.outputs.present == 'true'
+        shell: pwsh
+        run: |
+          $proj = Get-ChildItem build-uwp/*.vcxproj | Where-Object { $_.Name -notmatch '^(ALL_BUILD|ZERO_CHECK|INSTALL)' } | Select-Object -First 1
+          msbuild $proj.FullName /m /p:Configuration=Release /p:Platform=x64 `
+            /p:AppxPackageDir="$env:GITHUB_WORKSPACE\AppPackages\\" `
+            /p:GenerateAppxPackageOnBuild=true /p:AppxBundle=Never `
+            /p:AppxPackageSigningEnabled=true `
+            /p:PackageCertificateKeyFile="$env:GITHUB_WORKSPACE\build-uwp\test-signing.pfx" `
+            /p:PackageCertificatePassword=2k5remade
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item build-uwp/test-signing.cer AppPackages/
+
+      - name: Upload Xbox package
+        if: steps.project.outputs.present == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: NFL2K5-Xbox-UWP
+          path: AppPackages/**
+          if-no-files-found: error
